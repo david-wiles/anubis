@@ -3,13 +3,18 @@ package pkg
 import "anubis/internal"
 
 // Returns a config object based on the current environment. Env variables are checked first, then args
-func ParseEnv() *Config {
-	c, err := internal.ParseArgs()
+func FromEnv() *Config {
+	c, err := internal.FromEnv()
 	if err != nil {
 		// TODO helpful messages on config errors
 		panic(err)
 	}
 	return (*Config)(c)
+}
+
+type Anubis struct {
+	Config *Config
+	s      *internal.Supervisor
 }
 
 func NewAnubis(config *Config) *Anubis {
@@ -21,6 +26,11 @@ func NewAnubis(config *Config) *Anubis {
 
 func (a *Anubis) WithPipeline(pipeline Pipeline) *Anubis {
 	a.s.Pipeline = pipeline
+	return a
+}
+
+func (a *Anubis) WithLinkJudge(judge internal.LinkJudge) *Anubis {
+	a.s.ShouldAddLink = judge
 	return a
 }
 

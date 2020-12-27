@@ -12,27 +12,31 @@ import (
 )
 
 type worker struct {
-	id       int
-	queue    chan string
-	errors   chan error
-	state    chan WorkerState
-	sent     chan CompletedRequest
-	found    chan FoundUrl
-	pipeline []PipelineFunc
-	config   *Config
+	id         int
+	queue      chan string
+	errors     chan error
+	state      chan workerState
+	sent       chan CompletedRequest
+	discovered chan DiscoveredLink
+	pipeline   []PipelineFunc
+	client     *http.Client
+	config     *Config
 }
 
-type PipelineFunc func([]byte, string, chan FoundUrl) ([]byte, error)
+type PipelineFunc func([]byte, string, DiscoveredChan) ([]byte, error)
 
-type WorkerState int
+type workerState struct {
+	id    int
+	state int
+}
 
 var (
-	WorkerStateInactive  WorkerState = 0 // No work for this worker to do
-	WorkerStateWaiting   WorkerState = 1 // Pipeline running but waiting for another url to process
-	WorkerStateRunning   WorkerState = 2 // Currently processing a url
-	WorkerStateStopping  WorkerState = 3 // Received stop signal, waiting for pipelines to finish
-	WorkerStateFinished  WorkerState = 4 // Finished all pending work
-	WorkerStateReceiving WorkerState = 5 // Receiving work from supervisor
+	WorkerStateInactive  = 0 // No work for this worker to do
+	WorkerStateWaiting   = 1 // Pipeline running but waiting for another url to process
+	WorkerStateRunning   = 2 // Currently processing a url
+	WorkerStateStopping  = 3 // Received stop signal, waiting for pipelines to finish
+	WorkerStateFinished  = 4 // Finished all pending work
+	WorkerStateReceiving = 5 // Receiving work from supervisor
 )
 
 type CompletedRequest struct {
@@ -54,10 +58,10 @@ func (w *worker) Start() {
 				pipelines -= 1
 				if pipelines == 0 {
 					if !isWorking {
-						w.state <- WorkerStateInactive
+						w.state <- workerState{w.id, WorkerStateInactive}
 					}
 					if stopping {
-						w.state <- WorkerStateFinished
+						w.state <- workerState{w.id, WorkerStateFinished}
 						break
 					}
 				}
@@ -66,15 +70,15 @@ func (w *worker) Start() {
 		}
 	}()
 
-	w.state <- WorkerStateInactive
+	w.state <- workerState{w.id, WorkerStateInactive}
 	u, ok := <-w.queue
 
 	// Main loop for worker threads. Send a request and pass the response to the pipeline for processing
 	for ok {
 		isWorking = true
-		w.state <- WorkerStateRunning
+		w.state <- workerState{w.id, WorkerStateRunning}
 
-		if resp, err := SendRequest(u, w.config); err == nil {
+		if resp, err := SendRequest(w.client, u, w.config); err == nil {
 			w.sent <- CompletedRequest{u, resp.StatusCode}
 			pipelines += 1
 			go w.runPipeline(resp, u, notifier)
@@ -85,9 +89,9 @@ func (w *worker) Start() {
 		time.Sleep(w.config.Delay)
 
 		if pipelines > 0 {
-			w.state <- WorkerStateWaiting
+			w.state <- workerState{w.id, WorkerStateWaiting}
 		} else {
-			w.state <- WorkerStateInactive
+			w.state <- workerState{w.id, WorkerStateInactive}
 		}
 
 		isWorking = false
@@ -96,13 +100,13 @@ func (w *worker) Start() {
 
 	// Set the state to 'stopping' so that the notifier knows what state to send to supervisor
 	// when all pipelines complete
-	w.state <- WorkerStateStopping
+	w.state <- workerState{w.id, WorkerStateStopping}
 	stopping = true
 
 	// If there are no pipelines open at this point, we can go ahead and stop the worker
 	if pipelines == 0 {
 		close(notifier)
-		w.state <- WorkerStateFinished
+		w.state <- workerState{w.id, WorkerStateFinished}
 	}
 }
 
@@ -116,7 +120,7 @@ func (w *worker) runPipeline(r *http.Response, u string, notifier chan bool) {
 	_ = r.Body.Close()
 
 	for _, step := range w.pipeline {
-		b, err = step(b, u, w.found)
+		b, err = step(b, u, w.discovered)
 		if err != nil {
 			w.errors <- err
 		}
