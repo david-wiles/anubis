@@ -90,8 +90,59 @@ func (s *Supervisor) Start() error {
 		return err
 	}
 
-	go s.writeErrors() // writes all errors to stderr
-	go s.manageUrls()  // Manages all sent urls and discovered urls to prevent duplicates and loops
+	var stats *os.File = nil
+
+	if s.config.Stats != "" {
+		stats, err = os.OpenFile(s.config.Stats, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		defer stats.Close()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Write all errors to stderr
+	go func() {
+		err, ok := <-s.errors
+
+		for ok {
+			Log.LogError(err)
+			err, ok = <-s.errors
+		}
+	}()
+
+	// Save all responses into the global url map to prevent duplicates
+	go func() {
+		res, ok := <-s.sent
+		for ok {
+			Log.Info(res.U + " " + strconv.Itoa(res.S))
+
+			if stats != nil {
+				// What else would we want to include here?
+				_, err = stats.WriteString(res.U + " " + strconv.Itoa(res.S) + "\n")
+				if err != nil {
+					s.errors <- err
+				}
+			}
+
+			s.sentUrls[res.U] = res.S
+			res, ok = <-s.sent
+		}
+	}()
+
+	// Add links from discovered chan to URL queue
+	go func() {
+		f, ok := <-s.discovered
+		for ok {
+			Log.Info("Found link " + f.Url.String())
+
+			if s.ShouldAddLink(f) {
+				s.addLink(f.Url.String())
+			}
+
+			f, ok = <-s.discovered
+		}
+	}()
+
 	go s.monitorWorkers()
 	s.startWorkers()
 
@@ -173,41 +224,6 @@ func (s *Supervisor) startWorkers() {
 		Log.Info("Starting worker " + strconv.Itoa(i))
 		go w.Start()
 	}
-}
-
-func (s *Supervisor) writeErrors() {
-	err, ok := <-s.errors
-
-	for ok {
-		Log.LogError(err)
-		err, ok = <-s.errors
-	}
-}
-
-func (s *Supervisor) manageUrls() {
-	// Save all responses into the global url map to prevent duplicates
-	go func() {
-		res, ok := <-s.sent
-		for ok {
-			Log.Info(res.U + " " + strconv.Itoa(res.S))
-			s.sentUrls[res.U] = res.S
-			res, ok = <-s.sent
-		}
-	}()
-
-	// Add links from discovered chan to URL queue
-	go func() {
-		f, ok := <-s.discovered
-		for ok {
-			Log.Info("Found link " + f.Url.String())
-
-			if s.ShouldAddLink(f) {
-				s.addLink(f.Url.String())
-			}
-
-			f, ok = <-s.discovered
-		}
-	}()
 }
 
 func (s *Supervisor) addLink(u string) {

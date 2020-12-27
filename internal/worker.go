@@ -133,9 +133,11 @@ func (w *worker) runPipeline(r *http.Response, u string, notifier chan bool) {
 	}
 
 	// Write file
-	err = w.writeBytes(b, parsed)
-	if err != nil {
-		w.errors <- err
+	if w.config.Output == "" {
+		err = w.writeBytes(b, parsed)
+		if err != nil {
+			w.errors <- err
+		}
 	}
 
 	notifier <- true
