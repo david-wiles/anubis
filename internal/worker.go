@@ -40,8 +40,8 @@ var (
 )
 
 type CompletedRequest struct {
-	U string
-	S int
+	Url        string
+	StatusCode int
 }
 
 func (w *worker) Start() {
@@ -133,7 +133,7 @@ func (w *worker) runPipeline(r *http.Response, u string, notifier chan bool) {
 	}
 
 	// Write file
-	if w.config.Output == "" {
+	if w.config.Output != "" {
 		err = w.writeBytes(b, parsed)
 		if err != nil {
 			w.errors <- err

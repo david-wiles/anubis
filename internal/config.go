@@ -106,7 +106,7 @@ func FromEnv() (c *Config, err error) {
 		c.Url += "/"
 	}
 
-	if c.Output[len(c.Output)-1] != '/' {
+	if c.Output != "" && c.Output[len(c.Output)-1] != '/' {
 		c.Output += "/"
 	}
 

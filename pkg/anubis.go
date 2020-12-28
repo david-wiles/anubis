@@ -1,6 +1,9 @@
 package pkg
 
-import "anubis/internal"
+import (
+	"anubis/internal"
+	"net/url"
+)
 
 // Returns a config object based on the current environment. Env variables are checked first, then args
 func FromEnv() *Config {
@@ -36,4 +39,10 @@ func (a *Anubis) WithLinkJudge(judge internal.LinkJudge) *Anubis {
 
 func (a *Anubis) Start() error {
 	return a.s.Start()
+}
+
+func (a *Anubis) AddLink(link *url.URL) {
+	if err := a.s.Urls.QueueLink(link, a.s.QueueWork); err != nil {
+		internal.Log.LogError(err)
+	}
 }

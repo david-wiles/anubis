@@ -24,23 +24,11 @@ type Supervisor struct {
 	// channel should be added to the url queue or not.
 	ShouldAddLink LinkJudge
 
+	Urls *UrlsManager // Manages urls and queued urls. This can be shared between instances of Anubis
+
 	client *http.Client // http.Client to use when making requests
 
-	// Urls are placed in a queue and then passed to workers one at a time.
-	// This queue may be added to over the course of the program if links should
-	// be followed. A mutex is necessary to ensure that no race conditions occur when
-	// passing urls to workers
-	urlQueue []string
-	qMutex   *sync.Mutex
-
-	sent     chan CompletedRequest // Channel used by workers to notify supervisor of completed requests
-	sentUrls map[string]int        // map of completed requests and their status codes
-
-	// Any links discovered when parsing html can be passed to the supervisor to be added to the queue.
-	// All pipeline funcs have access to this channel to allow for custom rules when following links.
-	discovered DiscoveredChan
-
-	errors chan error // any non-fatal errors which occur in worker threads are passed to the supervisor
+	sent chan CompletedRequest // Channel used by workers to notify supervisor of completed requests
 
 	// References to each worker thread and its state. The worker state is used to
 	// determine whether the program should exit based on what all threads are doing.
@@ -53,6 +41,8 @@ type Supervisor struct {
 
 	config *Config   // configuration object used
 	done   chan bool // Used to block the main thread until all work is done
+
+	errors chan error // any non-fatal errors which occur in worker threads are passed to the supervisor
 }
 
 func NewSupervisor(config *Config) *Supervisor {
@@ -65,15 +55,20 @@ func NewSupervisor(config *Config) *Supervisor {
 
 	Log = &Logger{os.Stdout, os.Stderr, 0}
 
+	e := make(chan error)
+
 	return &Supervisor{
 		ShouldAddLink: func(f DiscoveredLink) bool { return true }, // By default, all links will be added
 		client:        client,
-		urlQueue:      []string{},
-		qMutex:        &sync.Mutex{},
 		sent:          make(chan CompletedRequest),
-		sentUrls:      make(map[string]int),
-		discovered:    make(DiscoveredChan),
-		errors:        make(chan error),
+		Urls: &UrlsManager{
+			Queue:      []string{},
+			qmu:        &sync.Mutex{},
+			Completed:  make(map[string]int),
+			discovered: make(DiscoveredChan),
+			errors:     e,
+		},
+		errors:        e,
 		workers:       []*worker{},
 		currentStates: make([]int, config.Workers),
 		workerStates:  make(chan workerState),
@@ -114,35 +109,23 @@ func (s *Supervisor) Start() error {
 	go func() {
 		res, ok := <-s.sent
 		for ok {
-			Log.Info(res.U + " " + strconv.Itoa(res.S))
+			Log.Info(res.Url + " " + strconv.Itoa(res.StatusCode))
 
 			if stats != nil {
 				// What else would we want to include here?
-				_, err = stats.WriteString(res.U + " " + strconv.Itoa(res.S) + "\n")
+				_, err = stats.WriteString(res.Url + " " + strconv.Itoa(res.StatusCode) + "\n")
 				if err != nil {
 					s.errors <- err
 				}
 			}
 
-			s.sentUrls[res.U] = res.S
+			s.Urls.RecordResponse(res)
+
 			res, ok = <-s.sent
 		}
 	}()
 
-	// Add links from discovered chan to URL queue
-	go func() {
-		f, ok := <-s.discovered
-		for ok {
-			Log.Info("Found link " + f.Url.String())
-
-			if s.ShouldAddLink(f) {
-				s.addLink(f.Url.String())
-			}
-
-			f, ok = <-s.discovered
-		}
-	}()
-
+	go s.Urls.Monitor(s.ShouldAddLink, s.QueueWork)
 	go s.monitorWorkers()
 	s.startWorkers()
 
@@ -162,8 +145,17 @@ func (s *Supervisor) Terminate() {
 		Log.Info("Stopping worker " + strconv.Itoa(worker.id))
 		close(worker.queue)
 	}
-	// Empty url queue
-	s.urlQueue = []string{}
+	s.Urls.Close()
+	s.Urls.Empty()
+}
+
+func (s *Supervisor) QueueWork() {
+	for _, worker := range s.workers {
+		if s.currentStates[worker.id] == WorkerStateInactive || s.currentStates[worker.id] == WorkerStateWaiting {
+			s.sendWork(worker)
+			break
+		}
+	}
 }
 
 // Build seed urls based on configuration. Checks sitemap first if configured to add urls.
@@ -196,7 +188,7 @@ func (s *Supervisor) buildSeed() error {
 		seed = append(seed, s.config.Url)
 	}
 
-	s.urlQueue = seed
+	s.Urls.QueueStrings(seed...)
 
 	if len(seed) > 0 {
 		Log.Info("Found " + strconv.Itoa(len(seed)) + " seed urls")
@@ -215,7 +207,7 @@ func (s *Supervisor) startWorkers() {
 			errors:     s.errors,
 			state:      s.workerStates,
 			sent:       s.sent,
-			discovered: s.discovered,
+			discovered: s.Urls.discovered,
 			pipeline:   s.Pipeline,
 			client:     s.client,
 			config:     s.config,
@@ -223,34 +215,6 @@ func (s *Supervisor) startWorkers() {
 		s.workers = append(s.workers, w)
 		Log.Info("Starting worker " + strconv.Itoa(i))
 		go w.Start()
-	}
-}
-
-func (s *Supervisor) addLink(u string) {
-	if _, ok := s.sentUrls[u]; !ok {
-		// Make sure link isn't already in queue
-		// TODO maybe use something other than a slice here
-		for _, qUrl := range s.urlQueue {
-			if qUrl == u {
-				Log.Info("Link " + u + " already in queue, ignoring")
-				return
-			}
-		}
-
-		s.qMutex.Lock()
-		s.urlQueue = append(s.urlQueue, u)
-		s.qMutex.Unlock()
-
-		// Check for idle workers to send new url to.
-		// If none are idle, then the url will sit in the queue
-		for _, worker := range s.workers {
-			if s.currentStates[worker.id] == WorkerStateInactive || s.currentStates[worker.id] == WorkerStateWaiting {
-				s.sendWork(worker)
-				break
-			}
-		}
-	} else {
-		Log.Info("Already processed link " + u + ", ignoring")
 	}
 }
 
@@ -292,34 +256,25 @@ func (s *Supervisor) checkProgramState(id int) {
 		}
 	}
 
-	if len(s.urlQueue) == 0 {
+	if s.Urls.IsComplete() {
 		s.done <- true
 	}
 }
 
-// Thread-safe array shift
-func (s *Supervisor) shiftQueue() (string, bool) {
-	u := ""
-	ok := false
-
-	s.qMutex.Lock()
-	if len(s.urlQueue) > 0 {
-		u, ok = s.urlQueue[0], true
-		s.urlQueue = s.urlQueue[1:]
-	}
-	s.qMutex.Unlock()
-	return u, ok
-}
-
-// Send work to the specified worker. Immediately set the worker's state to receiving to prevent
-// race condition in program's state
+// Send work to the specified worker
+// Immediately set the worker's state to receiving to prevent race condition in program's state
 func (s *Supervisor) sendWork(w *worker) {
-	u, ok := s.shiftQueue()
+	u, ok := s.Urls.ShiftQueue()
 	if ok {
 		Log.Info("Sending " + u + " to worker " + strconv.Itoa(w.id))
 		s.currentStates[w.id] = WorkerStateReceiving
 		Log.Info("STATUS Worker " + strconv.Itoa(w.id) + ": receiving")
-		s.sentUrls[u] = 0 // Placeholder to prevent this link from being added again
+
+		// Placeholder to prevent this link from being added again
+		s.Urls.RecordResponse(CompletedRequest{
+			Url: u,
+		})
+
 		w.queue <- u
 	}
 }
