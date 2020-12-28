@@ -3,6 +3,7 @@ package internal
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"sync"
@@ -24,11 +25,11 @@ type Supervisor struct {
 	// channel should be added to the url queue or not.
 	ShouldAddLink LinkJudge
 
-	Urls *UrlsManager // Manages urls and queued urls. This can be shared between instances of Anubis
+	Urls UrlsManager // Manages urls and queued urls. This can be shared between instances of Anubis
 
-	client *http.Client // http.Client to use when making requests
+	Driver WebDriver // WebDriver to use (e.g. GeckoDriver). A wrapper must be created for each driver
 
-	sent chan CompletedRequest // Channel used by workers to notify supervisor of completed requests
+	config *Config // configuration object used
 
 	// References to each worker thread and its state. The worker state is used to
 	// determine whether the program should exit based on what all threads are doing.
@@ -39,48 +40,41 @@ type Supervisor struct {
 	currentStates []int            // The current state of each worker
 	workerStates  chan workerState // Channel for workers to notify supervisor of their state
 
-	config *Config   // configuration object used
-	done   chan bool // Used to block the main thread until all work is done
-
-	errors chan error // any non-fatal errors which occur in worker threads are passed to the supervisor
+	done       chan bool             // Used to block the main thread until all work is done
+	sent       chan CompletedRequest // Channel used by workers to notify supervisor of completed requests
+	discovered DiscoveredChan        // Channel to send discovered links to supervisor from workers or pipelines
+	errors     chan error            // any non-fatal errors which occur in worker threads are passed to the supervisor
 }
 
 func NewSupervisor(config *Config) *Supervisor {
-	client := &http.Client{
-		Transport:     nil,
-		CheckRedirect: nil,
-		Jar:           nil,
-		Timeout:       0,
-	}
-
 	Log = &Logger{os.Stdout, os.Stderr, 0}
-
-	e := make(chan error)
 
 	return &Supervisor{
 		ShouldAddLink: func(f DiscoveredLink) bool { return true }, // By default, all links will be added
-		client:        client,
-		sent:          make(chan CompletedRequest),
-		Urls: &UrlsManager{
-			Queue:      []string{},
-			qmu:        &sync.Mutex{},
-			Completed:  make(map[string]int),
-			discovered: make(DiscoveredChan),
-			errors:     e,
+		Urls: &DefaultUrlsManager{
+			Queue:     []string{},
+			qmu:       &sync.Mutex{},
+			Completed: make(map[string]int),
 		},
-		errors:        e,
+		Driver: &DefaultWebDriver{
+			client:    http.DefaultClient,
+			userAgent: config.UserAgent,
+		},
+		config:        config,
 		workers:       []*worker{},
 		currentStates: make([]int, config.Workers),
 		workerStates:  make(chan workerState),
-		config:        config,
 		done:          make(chan bool, 1),
+		sent:          make(chan CompletedRequest),
+		discovered:    make(DiscoveredChan),
+		errors:        make(chan error),
 	}
 }
 
 // Generate all seed urls and start all worker threads
 func (s *Supervisor) Start() error {
 	Log.Info("Starting Anubis...")
-	err := s.buildSeed()
+	err := s.buildSeedUrls()
 	if err != nil {
 		return err
 	}
@@ -89,10 +83,10 @@ func (s *Supervisor) Start() error {
 
 	if s.config.Stats != "" {
 		stats, err = os.OpenFile(s.config.Stats, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		defer stats.Close()
 		if err != nil {
 			return err
 		}
+		defer stats.Close()
 	}
 
 	// Write all errors to stderr
@@ -125,7 +119,29 @@ func (s *Supervisor) Start() error {
 		}
 	}()
 
-	go s.Urls.Monitor(s.ShouldAddLink, s.QueueWork)
+	go func() { // Add links from discovered chan to URL queue
+		f, ok := <-s.discovered
+		for ok {
+			Log.Info("Found link " + f.Url.String())
+
+			if s.ShouldAddLink(f) {
+				errs := s.Urls.QueueLinks(f.Url)
+				for _, e := range errs {
+					s.errors <- e
+				}
+
+				// Send work to an idle worker
+				for _, worker := range s.workers {
+					if s.currentStates[worker.id] == WorkerStateInactive || s.currentStates[worker.id] == WorkerStateWaiting {
+						s.sendWork(worker)
+					}
+				}
+			}
+
+			f, ok = <-s.discovered
+		}
+	}()
+
 	go s.monitorWorkers()
 	s.startWorkers()
 
@@ -145,28 +161,20 @@ func (s *Supervisor) Terminate() {
 		Log.Info("Stopping worker " + strconv.Itoa(worker.id))
 		close(worker.queue)
 	}
-	s.Urls.Close()
-	s.Urls.Empty()
-}
-
-func (s *Supervisor) QueueWork() {
-	for _, worker := range s.workers {
-		if s.currentStates[worker.id] == WorkerStateInactive || s.currentStates[worker.id] == WorkerStateWaiting {
-			s.sendWork(worker)
-			break
-		}
-	}
+	s.Urls.CloseQueue()
+	s.Urls.EmptyQueue()
 }
 
 // Build seed urls based on configuration. Checks sitemap first if configured to add urls.
 // By default, the base url will be part of the seed urls
-func (s *Supervisor) buildSeed() error {
+func (s *Supervisor) buildSeedUrls() error {
 	var seed []string
+	var urls []*url.URL
 
 	// If there are no seed urls, we will try sitemap.xml.
 	// The program should exit with an error if we can't get this file
 	if s.config.Sitemap != "" {
-		resp, err := SendRequest(s.client, s.config.Sitemap, s.config)
+		resp, err := s.Driver.SendRequest(s.config.Sitemap)
 		if err != nil {
 			return err
 		}
@@ -188,7 +196,21 @@ func (s *Supervisor) buildSeed() error {
 		seed = append(seed, s.config.Url)
 	}
 
-	s.Urls.QueueStrings(seed...)
+	for _, s := range seed {
+		if u, err := ParseUrl(s); err == nil {
+			urls = append(urls, u)
+		} else {
+			return errors.New(s + " is not a valid url")
+		}
+	}
+
+	if errs := s.Urls.QueueLinks(urls...); len(errs) != 0 {
+		errText := "Errors occurred when queueing urls: "
+		for _, err := range errs {
+			errText += err.Error() + "\n"
+		}
+		return errors.New(errText)
+	}
 
 	if len(seed) > 0 {
 		Log.Info("Found " + strconv.Itoa(len(seed)) + " seed urls")
@@ -207,9 +229,9 @@ func (s *Supervisor) startWorkers() {
 			errors:     s.errors,
 			state:      s.workerStates,
 			sent:       s.sent,
-			discovered: s.Urls.discovered,
+			discovered: s.discovered,
 			pipeline:   s.Pipeline,
-			client:     s.client,
+			driver:     s.Driver,
 			config:     s.config,
 		}
 		s.workers = append(s.workers, w)
@@ -225,7 +247,7 @@ func (s *Supervisor) monitorWorkers() {
 	for ok {
 		switch state.state {
 		case WorkerStateInactive:
-			s.checkProgramState(state.id)
+			s.checkExitCondition(state.id)
 			Log.Info("STATUS Worker " + strconv.Itoa(state.id) + ": inactive")
 			fallthrough
 		case WorkerStateWaiting:
@@ -248,7 +270,7 @@ func (s *Supervisor) monitorWorkers() {
 // Check the state of the program to make sure that there is still more work to be done
 // This is accomplished by checking if all workers are inactive or finished.
 // Then if the url queue is still empty, we should exit the program
-func (s *Supervisor) checkProgramState(id int) {
+func (s *Supervisor) checkExitCondition(id int) {
 	s.currentStates[id] = WorkerStateInactive
 	for _, state := range s.currentStates {
 		if state != WorkerStateInactive && state != WorkerStateFinished {
@@ -269,11 +291,6 @@ func (s *Supervisor) sendWork(w *worker) {
 		Log.Info("Sending " + u + " to worker " + strconv.Itoa(w.id))
 		s.currentStates[w.id] = WorkerStateReceiving
 		Log.Info("STATUS Worker " + strconv.Itoa(w.id) + ": receiving")
-
-		// Placeholder to prevent this link from being added again
-		s.Urls.RecordResponse(CompletedRequest{
-			Url: u,
-		})
 
 		w.queue <- u
 	}

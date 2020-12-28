@@ -18,8 +18,8 @@ type worker struct {
 	state      chan workerState
 	sent       chan CompletedRequest
 	discovered chan DiscoveredLink
+	driver     WebDriver
 	pipeline   []PipelineFunc
-	client     *http.Client
 	config     *Config
 }
 
@@ -42,6 +42,7 @@ var (
 type CompletedRequest struct {
 	Url        string
 	StatusCode int
+	Header     http.Header
 }
 
 func (w *worker) Start() {
@@ -78,8 +79,8 @@ func (w *worker) Start() {
 		isWorking = true
 		w.state <- workerState{w.id, WorkerStateRunning}
 
-		if resp, err := SendRequest(w.client, u, w.config); err == nil {
-			w.sent <- CompletedRequest{u, resp.StatusCode}
+		if resp, err := w.driver.SendRequest(u); err == nil {
+			w.sent <- CompletedRequest{u, resp.StatusCode, resp.Header.Clone()}
 			pipelines += 1
 			go w.runPipeline(resp, u, notifier)
 		} else {

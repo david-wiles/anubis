@@ -42,7 +42,5 @@ func (a *Anubis) Start() error {
 }
 
 func (a *Anubis) AddLink(link *url.URL) {
-	if err := a.s.Urls.QueueLink(link, a.s.QueueWork); err != nil {
-		internal.Log.LogError(err)
-	}
+	_ = a.s.Urls.QueueLinks(link)
 }

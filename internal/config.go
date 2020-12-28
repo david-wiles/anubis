@@ -18,8 +18,7 @@ type Config struct {
 	Proxy     string        // --proxy, PROXY
 	Delay     time.Duration // --delay, DELAY
 	UserAgent string        // --user-agent, USER_AGENT
-	Auth      Auth
-	Workers   int // --workers, WORKERS
+	Workers   int           // --workers, WORKERS
 }
 
 func FromEnv() (c *Config, err error) {
