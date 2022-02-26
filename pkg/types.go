@@ -89,7 +89,7 @@ func (handler DefaultResponseHandler) Handle(req *http.Request, resp *http.Respo
 
 	p := path.Join(handler.Anubis.Output, req.URL.Hostname(), filename)
 
-	if err := os.MkdirAll(p, 0644); err != nil {
+	if err := os.MkdirAll(path.Dir(p), 0774); err != nil {
 		return err
 	}
 
