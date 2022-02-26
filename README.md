@@ -7,7 +7,3 @@ well in a directory with the name of the hostname.
 ## Anubis 
 
 Anubis is the Egyptian god of embalming. This project operates in a similar way, the present website will be preserved. 
-
-## Docker
-
-docker create -v /var/on/server:/home/app/output anubis 
