@@ -84,8 +84,14 @@ func (a *Anubis) AddURL(url string) bool {
 // Commit will use git to commit the files with the output directory specified by the start options.
 // If Anubis is started as a crawler, then this would commit all files changed up to that point
 func (a Anubis) Commit() error {
+	// Initialize repo if not already exist
+	cmd := exec.Command("git", "init", a.Output)
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
 	// Add all changes
-	cmd := exec.Command("git", "add", "-A")
+	cmd = exec.Command("git", "add", "-A")
 	if err := cmd.Run(); err != nil {
 		return err
 	}
