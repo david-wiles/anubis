@@ -33,9 +33,8 @@ func main() {
 		a.Handler.(anubis.DefaultResponseHandler).NeededLinks[url] = true
 	}
 
-	if err := a.Start(); err != nil {
-		panic(err)
-	}
+	a.Start()
+	a.Wait()
 
 	if err := a.Commit(); err != nil {
 		panic(err)
