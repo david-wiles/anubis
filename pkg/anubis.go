@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -85,13 +86,15 @@ func (a *Anubis) AddURL(url string) bool {
 // If Anubis is started as a crawler, then this would commit all files changed up to that point
 func (a Anubis) Commit() error {
 	// Initialize repo if not already exist
-	cmd := exec.Command("git", "init", a.Output)
+	cmd := exec.Command("git", "-C", a.Output, "init")
+	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return err
 	}
 
 	// Add all changes
-	cmd = exec.Command("git", "add", "-A")
+	cmd = exec.Command("git", "-C", a.Output, "add", "-A")
+	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return err
 	}
@@ -104,8 +107,18 @@ func (a Anubis) Commit() error {
 	// Add additional information about the system
 
 	// Commit changes
-	cmd = exec.Command("git", "commit", "-m", commitBuilder.String())
-	return cmd.Run()
+	cmd = exec.Command("git", "-C", a.Output, "commit", "-m", commitBuilder.String())
+	cmd.Stderr = os.Stderr
+
+	// Check if output contains 'nothing to commit', in which case there was no error
+	b, err := cmd.Output()
+	if err != nil {
+		if !strings.Contains(string(b), "nothing to commit") {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func processURL(url string, headers map[string]string, webdriver WebDriver, handler ResponseHandler) error {
@@ -147,8 +160,10 @@ func (a Anubis) worker(ctx context.Context, queue chan string) {
 		default:
 			url, ok = <-queue
 
-			if err := processURL(url, a.Headers, a.Driver, a.Handler); err != nil {
-				log.Println(err)
+			if ok {
+				if err := processURL(url, a.Headers, a.Driver, a.Handler); err != nil {
+					log.Println(err)
+				}
 			}
 		}
 	}
