@@ -25,11 +25,14 @@ type Anubis struct {
 
 	Driver  WebDriver       // Driver is a WebDriver instance which will dictate how the network requests are made
 	Handler ResponseHandler // Handler controls how the responses are handled before copied to a file
+	Filter  DuplicateFilter // Filter will be used to ensure URLs are only fetched once
 
-	wg    *sync.WaitGroup // wg is used to ensure that all workers finish before the program exits
-	queue chan string     // queue is used to pass URLs to worker goroutines
+	wg        *sync.WaitGroup  // wg is used to ensure that all workers finish before the program exits
+	queue     chan string      // queue is used to pass URLs to worker goroutines
+	processor RequestProcessor // The request processor to use for each worker. Mainly useful for testing
 
-	Cancel func() // Cancel should be called when the program should finish work
+	Context context.Context // Context associated with this instance
+	Cancel  func()          // Cancel should be called when the program should finish work
 }
 
 // NewAnubis creates an Anubis instance from the given arguments. If not overwritten, all fields will use
@@ -40,13 +43,19 @@ func NewAnubis(options ...Option) *Anubis {
 		Workers: 4,
 		Headers: make(map[string]string),
 		Driver:  DefaultWebDriver{client: *http.DefaultClient},
+		Filter:  &DefaultDuplicateFilter{&sync.Map{}},
 		Handler: nil,
 		wg:      &sync.WaitGroup{},
 		queue:   make(chan string, 256),
-		Cancel:  nil,
+		Context: context.TODO(),
+		Cancel: func() {
+			panic("Anubis has not started, cannot cancel")
+		},
 	}
 
 	a.Handler = DefaultResponseHandler{a, make(map[string]bool)}
+	a.processor = &DefaultRequestProcessor{}
+
 	for _, opt := range options {
 		opt.SetOpt(a)
 	}
@@ -55,21 +64,24 @@ func NewAnubis(options ...Option) *Anubis {
 
 // Start will create the context for the instance and start all workers. Workers will immediately begin
 // making network requests and processing responses
-func (a *Anubis) Start() error {
-	ctx, cancel := context.WithCancel(context.Background())
+func (a *Anubis) Start() {
+	ctx, cancel := context.WithCancel(a.Context)
+	a.Context = ctx
 	a.Cancel = func() {
-		close(a.queue)
 		cancel()
+		// Close queue so workers will stop processing when buffer is drained
+		close(a.queue)
 	}
 
 	for n := 0; n < a.Workers; n++ {
 		a.wg.Add(1)
-		go a.worker(ctx, a.queue)
+		go a.worker(a.processor, a.queue)
 	}
+}
 
+// Wait for all work to complete
+func (a *Anubis) Wait() {
 	a.wg.Wait()
-
-	return nil
 }
 
 // AddURL will push a new url to the queue if it is not a duplicate. This function may block the caller
@@ -77,9 +89,17 @@ func (a *Anubis) Start() error {
 //
 // The function will return true if the link was added to the queue, and false otherwise.
 func (a *Anubis) AddURL(url string) bool {
-	// TODO duplicate filter
-	a.queue <- url
-	return true
+	if a.Context.Err() != nil {
+		return false
+	}
+
+	if !a.Filter.TestURL(url) {
+		a.queue <- url
+		return true
+	}
+
+	// URL was already processed
+	return false
 }
 
 // Commit will use git to commit the files with the output directory specified by the start options.
@@ -121,50 +141,14 @@ func (a Anubis) Commit() error {
 	return nil
 }
 
-func processURL(url string, headers map[string]string, webdriver WebDriver, handler ResponseHandler) error {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := webdriver.DoRequest(req)
-	if err != nil {
-		return err
-	}
-
-	if err := handler.Handle(req, resp); err != nil {
-		log.Println(err)
-	}
-
-	return nil
-}
-
 // Each worker will read URLs from the channel until the context is cancelled or the queue is closed.
 // This is started by calling anubis.Start(), so all start URLs should be added first
-func (a Anubis) worker(ctx context.Context, queue chan string) {
+func (a Anubis) worker(processor RequestProcessor, queue chan string) {
 	defer a.wg.Done()
 
-	var (
-		url string
-		ok  bool = true
-	)
-
-	for ok {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			url, ok = <-queue
-
-			if ok {
-				if err := processURL(url, a.Headers, a.Driver, a.Handler); err != nil {
-					log.Println(err)
-				}
-			}
+	for url := range queue {
+		if err := processor.Process(url, a.Headers, a.Driver, a.Handler); err != nil {
+			log.Println(err)
 		}
 	}
 }

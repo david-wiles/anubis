@@ -2,10 +2,12 @@ package anubis
 
 import (
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"path"
 	"strings"
+	"sync"
 )
 
 type WebDriver interface {
@@ -98,4 +100,48 @@ func (handler DefaultResponseHandler) Handle(req *http.Request, resp *http.Respo
 	}
 
 	return nil
+}
+
+type RequestProcessor interface {
+	Process(string, map[string]string, WebDriver, ResponseHandler) error
+}
+
+type DefaultRequestProcessor struct{}
+
+func (*DefaultRequestProcessor) Process(url string, headers map[string]string, webdriver WebDriver, handler ResponseHandler) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := webdriver.DoRequest(req)
+	if err != nil {
+		return err
+	}
+
+	if err := handler.Handle(req, resp); err != nil {
+		log.Println(err)
+	}
+
+	return nil
+}
+
+type DuplicateFilter interface {
+	TestURL(string) bool
+}
+
+// DefaultDuplicateFilter uses a *sync.Map to store URLs in memory
+type DefaultDuplicateFilter struct {
+	store *sync.Map
+}
+
+// TestURL uses the LoadOrStore function in sync.Map to simultaneously determine whether the key exists and set its
+// value. If the key was already in the map, we return true, otherwise we'll return false
+func (filter *DefaultDuplicateFilter) TestURL(u string) bool {
+	_, exists := filter.store.LoadOrStore(u, true)
+	return exists
 }
