@@ -198,13 +198,10 @@ func Test_processURL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := processURL(tt.args.url, tt.args.headers, tt.args.webdriver, tt.args.handler)
+			err := processURL(tt.args.url, tt.args.headers, tt.args.webdriver, tt.args.handler)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("processURL() error = %v, wantErr %v", err, tt.wantErr)
 				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("processURL() got = %v, want %v", got, tt.want)
 			}
 		})
 	}

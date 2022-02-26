@@ -3,6 +3,9 @@ package anubis
 import (
 	"io/ioutil"
 	"net/http"
+	"os"
+	"path"
+	"strings"
 )
 
 type WebDriver interface {
@@ -44,15 +47,15 @@ type DefaultResponseHandler struct {
 func (handler DefaultResponseHandler) Handle(req *http.Request, resp *http.Response) error {
 	defer resp.Body.Close()
 
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
 	// Check whether this is an HTML response. If it is, then we should initialize the conditions
 	// to stop the anubis instance once all files have been downloaded
 	contentType := resp.Header.Get("Content-Type")
-	if contentType == "text/html" {
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-
+	if strings.Contains(contentType, "text/html") {
 		parentURL := req.URL.String()
 		bodyString := string(body)
 
@@ -75,6 +78,23 @@ func (handler DefaultResponseHandler) Handle(req *http.Request, resp *http.Respo
 	// Signal to all workers to exit if all work is finished
 	if len(handler.NeededLinks) == 0 {
 		handler.Anubis.Cancel()
+	}
+
+	filename := req.URL.Path
+
+	// If this is not a valid url, attempt to write to file system in a directory with the host name
+	if len(filename) == 0 || filename[len(filename)-1] == '/' {
+		filename = "index.html"
+	}
+
+	p := path.Join(handler.Anubis.Output, req.URL.Hostname(), filename)
+
+	if err := os.MkdirAll(p, 0644); err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(p, body, 0644); err != nil {
+		return err
 	}
 
 	return nil

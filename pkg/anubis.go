@@ -1,13 +1,9 @@
 package anubis
 
 import (
-	"bytes"
 	"context"
-	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -32,7 +28,7 @@ type Anubis struct {
 	wg    *sync.WaitGroup // wg is used to ensure that all workers finish before the program exits
 	queue chan string     // queue is used to pass URLs to worker goroutines
 
-	Cancel context.CancelFunc // Cancel is created by Anubis's context and should be called when the program should finish work
+	Cancel func() // Cancel should be called when the program should finish work
 }
 
 // NewAnubis creates an Anubis instance from the given arguments. If not overwritten, all fields will use
@@ -58,9 +54,12 @@ func NewAnubis(options ...Option) *Anubis {
 
 // Start will create the context for the instance and start all workers. Workers will immediately begin
 // making network requests and processing responses
-func (a Anubis) Start() error {
+func (a *Anubis) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
-	a.Cancel = cancel
+	a.Cancel = func() {
+		close(a.queue)
+		cancel()
+	}
 
 	for n := 0; n < a.Workers; n++ {
 		a.wg.Add(1)
@@ -103,10 +102,10 @@ func (a Anubis) Commit() error {
 	return cmd.Run()
 }
 
-func processURL(url string, headers map[string]string, webdriver WebDriver, handler ResponseHandler) ([]byte, error) {
+func processURL(url string, headers map[string]string, webdriver WebDriver, handler ResponseHandler) error {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	for k, v := range headers {
@@ -115,24 +114,14 @@ func processURL(url string, headers map[string]string, webdriver WebDriver, hand
 
 	resp, err := webdriver.DoRequest(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	defer resp.Body.Close()
-
-	// Read everything from response body into a byte array, so we can read it again later
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	// Reset body with identical bytes
-	resp.Body = io.NopCloser(bytes.NewReader(body))
 	if err := handler.Handle(req, resp); err != nil {
 		log.Println(err)
 	}
 
-	return body, nil
+	return nil
 }
 
 // Each worker will read URLs from the channel until the context is cancelled or the queue is closed.
@@ -140,7 +129,11 @@ func processURL(url string, headers map[string]string, webdriver WebDriver, hand
 func (a Anubis) worker(ctx context.Context, queue chan string) {
 	defer a.wg.Done()
 
-	url, ok := <-queue
+	var (
+		url string
+		ok  bool = true
+	)
+
 	for ok {
 		select {
 		case <-ctx.Done():
@@ -148,13 +141,7 @@ func (a Anubis) worker(ctx context.Context, queue chan string) {
 		default:
 			url, ok = <-queue
 
-			body, err := processURL(url, a.Headers, a.Driver, a.Handler)
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-
-			if err := os.WriteFile(a.Output, body, 0644); err != nil {
+			if err := processURL(url, a.Headers, a.Driver, a.Handler); err != nil {
 				log.Println(err)
 			}
 		}
